@@ -1,0 +1,385 @@
+import { clerkClient, getAuth } from "@clerk/express";
+import User from "../models/User.js";
+import Purchase from "../models/Purchase.js";
+import Stripe from "stripe";
+import Course from "../models/Course.js";
+import { CourseProgress } from "../models/courseProgress.js";
+
+const ensureUserExists = async (userId) => {
+   let user = await User.findById(userId);
+
+   if (user) {
+      return user;
+   }
+
+   const clerkUser = await clerkClient.users.getUser(userId);
+
+   user = await User.create({
+      _id: clerkUser.id,
+      email: clerkUser.emailAddresses?.[0]?.emailAddress || "",
+      name:
+         `${clerkUser.firstName || ""} ${clerkUser.lastName || ""}`.trim() ||
+         "User",
+      imageUrl: clerkUser.imageUrl || "",
+      enrolledCourses: [],
+   });
+
+   return user;
+};
+
+// ✅ Get User Data
+export const getUserData = async (req, res) => {
+   try {
+      const { userId } = getAuth(req);
+
+      if (!userId) {
+         return res.status(401).json({
+            success: false,
+            message: "Unauthorized - User ID not found",
+         });
+      }
+
+      const user = await ensureUserExists(userId);
+
+      res.json({
+         success: true,
+         user,
+      });
+   } catch (error) {
+      console.log("❌ ERROR:", error);
+      res.status(500).json({
+         success: false,
+         message: error.message,
+      });
+   }
+};
+
+// ✅ Get Enrolled Courses
+export const userEnrolledCourses = async (req, res) => {
+   try {
+      const { userId } = getAuth(req);
+
+      if (!userId) {
+         return res.status(401).json({
+            success: false,
+            message: "Unauthorized - User ID not found",
+         });
+      }
+
+      const userData = await ensureUserExists(userId);
+      await userData.populate("enrolledCourses");
+
+      res.json({
+         success: true,
+         enrolledCourses: userData?.enrolledCourses || [],
+      });
+   } catch (error) {
+      console.log("❌ ERROR:", error);
+      res.status(500).json({
+         success: false,
+         message: error.message,
+      });
+   }
+};
+
+// ✅ Purchase Course
+export const purchaseCourse = async (req, res) => {
+   try {
+      const { courseId } = req.body;
+      const { origin } = req.headers;
+      const { userId } = getAuth(req);
+
+      if (!userId) {
+         return res.status(401).json({
+            success: false,
+            message: "Unauthorized - User ID not found",
+         });
+      }
+
+      if (!courseId) {
+         return res.status(400).json({
+            success: false,
+            message: "Course ID is required",
+         });
+      }
+
+      const userData = await ensureUserExists(userId);
+      const courseData = await Course.findById(courseId);
+
+      if (!userData || !courseData) {
+         return res.status(404).json({
+            success: false,
+            message: "Data not found",
+         });
+      }
+
+      const amount = (
+         courseData.coursePrice -
+         (courseData.discount * courseData.coursePrice) / 100
+      ).toFixed(2);
+
+      const newPurchase = await Purchase.create({
+         courseId: courseData._id,
+         userId,
+         amount,
+      });
+
+      const stripeInstance = new Stripe(process.env.STRIPE_SECRET_KEY);
+      const currency = process.env.CURRENCY.toLowerCase();
+
+      const line_items = [
+         {
+            price_data: {
+               currency,
+               product_data: {
+                  name: courseData.courseTitle,
+               },
+               unit_amount: Math.floor(amount) * 100,
+            },
+            quantity: 1,
+         },
+      ];
+
+      const session = await stripeInstance.checkout.sessions.create({
+         success_url: `${origin}/loading/my-enrollments?session_id={CHECKOUT_SESSION_ID}`,
+         cancel_url: `${origin}/`,
+         line_items,
+         mode: "payment",
+         metadata: {
+            purchaseId: newPurchase._id.toString(),
+         },
+      });
+
+      res.json({
+         success: true,
+         session_url: session.url,
+      });
+   } catch (error) {
+      console.log("❌ ERROR:", error);
+      res.status(500).json({
+         success: false,
+         message: error.message,
+      });
+   }
+};
+
+export const verifyPurchase = async (req, res) => {
+   try {
+      const { sessionId } = req.body;
+      const { userId } = getAuth(req);
+
+      if (!sessionId) {
+         return res.status(400).json({
+            success: false,
+            message: "sessionId is required",
+         });
+      }
+
+      const stripeInstance = new Stripe(process.env.STRIPE_SECRET_KEY);
+      const session =
+         await stripeInstance.checkout.sessions.retrieve(sessionId);
+
+      if (session.payment_status !== "paid") {
+         return res.status(400).json({
+            success: false,
+            message: "Payment not completed",
+         });
+      }
+
+      const { purchaseId } = session.metadata || {};
+
+      if (!purchaseId) {
+         return res.status(400).json({
+            success: false,
+            message: "Purchase metadata missing",
+         });
+      }
+
+      const purchaseData = await Purchase.findById(purchaseId);
+      if (!purchaseData) {
+         return res.status(404).json({
+            success: false,
+            message: "Purchase not found",
+         });
+      }
+
+      if (purchaseData.userId !== userId) {
+         return res.status(403).json({
+            success: false,
+            message: "Unauthorized purchase access",
+         });
+      }
+
+      const userData = await ensureUserExists(userId);
+      const courseData = await Course.findById(purchaseData.courseId);
+
+      if (!courseData) {
+         return res.status(404).json({
+            success: false,
+            message: "Course not found",
+         });
+      }
+
+      if (!courseData.enrolledStudents.includes(userData._id)) {
+         courseData.enrolledStudents.push(userData._id);
+         await courseData.save();
+      }
+
+      if (
+         !userData.enrolledCourses.some(
+            (id) => id.toString() === courseData._id.toString(),
+         )
+      ) {
+         userData.enrolledCourses.push(courseData._id);
+         await userData.save();
+      }
+
+      purchaseData.status = "completed";
+      await purchaseData.save();
+
+      return res.json({
+         success: true,
+         message: "Purchase verified successfully",
+      });
+   } catch (error) {
+      console.log("ERROR:", error);
+      return res.status(500).json({
+         success: false,
+         message: error.message,
+      });
+   }
+};
+
+// ✅ Update Course Progress
+export const updateUserCourseProgress = async (req, res) => {
+   try {
+      const { userId } = getAuth(req);
+      const { courseId, lectureId } = req.body;
+
+      if (!courseId || !lectureId) {
+         return res.status(400).json({
+            success: false,
+            message: "courseId and lectureId are required",
+         });
+      }
+
+      let progressData = await CourseProgress.findOne({ userId, courseId });
+
+      if (progressData) {
+         if (progressData.lectureCompleted.includes(lectureId)) {
+            return res.json({
+               success: true,
+               message: "Lecture already completed",
+            });
+         }
+
+         progressData.lectureCompleted.push(lectureId);
+         await progressData.save();
+      } else {
+         await CourseProgress.create({
+            userId,
+            courseId,
+            lectureCompleted: [lectureId],
+         });
+      }
+
+      res.json({
+         success: true,
+         message: "Progress updated successfully",
+      });
+   } catch (err) {
+      console.log("❌ ERROR:", err);
+      res.status(500).json({
+         success: false,
+         message: err.message, // ✅ FIXED
+      });
+   }
+};
+
+// ✅ Get Course Progress (🔥 FIXED MAIN ERROR)
+export const getUserCourseProgress = async (req, res) => {
+   try {
+      const { userId } = getAuth(req); // ✅ FIXED
+
+      const { courseId } = req.body;
+
+      if (!courseId) {
+         return res.status(400).json({
+            success: false,
+            message: "courseId is required",
+         });
+      }
+
+      const progressData = await CourseProgress.findOne({
+         userId,
+         courseId,
+      });
+
+      res.json({
+         success: true,
+         progressData,
+      });
+   } catch (error) {
+      console.log("❌ ERROR:", error);
+      res.status(500).json({
+         success: false,
+         message: error.message,
+      });
+   }
+};
+
+// ✅ Add Rating
+export const addUserRating = async (req, res) => {
+   try {
+      const { userId } = getAuth(req);
+      const { courseId, rating } = req.body;
+
+      if (!courseId || !userId || !rating || rating < 1 || rating > 5) {
+         return res.json({
+            success: false,
+            message: "Invalid data",
+         });
+      }
+
+      const course = await Course.findById(courseId);
+
+      if (!course) {
+         return res.json({
+            success: false,
+            message: "Course not found",
+         });
+      }
+
+      const user = await User.findById(userId);
+
+      if (!user || !user.enrolledCourses.includes(courseId)) {
+         return res.json({
+            success: false,
+            message: "User not enrolled",
+         });
+      }
+
+      const existingIndex = course.courseRatings.findIndex(
+         (r) => r.userId.toString() === userId,
+      );
+
+      if (existingIndex > -1) {
+         course.courseRatings[existingIndex].rating = rating;
+      } else {
+         course.courseRatings.push({ userId, rating });
+      }
+
+      await course.save(); // ✅ IMPORTANT
+
+      res.json({
+         success: true,
+         message: "Rating added successfully",
+      });
+   } catch (error) {
+      console.log("❌ ERROR:", error);
+      res.status(500).json({
+         success: false,
+         message: error.message,
+      });
+   }
+};
